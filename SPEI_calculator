@@ -1,0 +1,177 @@
+// Definisce la durata della finestra temporale (in giorni) per il calcolo dello SPEI
+var timescaleDays = 90;
+
+// Definisce la data target per l'analisi dello SPEI
+var targetDate = '2017-08-21';
+
+// Crea un filtro temporale che considera solo i 90 giorni precedenti alla targetDate
+var dateFilter = ee.Filter.date(
+  ee.Date(targetDate).advance(-timescaleDays, 'day'), // 90 giorni prima
+  ee.Date(targetDate) // Fino alla data target
+);
+
+// Filtra il dataset per includere solo i dati della regione della Sicilia
+var gadm = ee.FeatureCollection('FAO/GAUL_SIMPLIFIED_500m/2015/level1')
+              .filter(ee.Filter.eq('ADM1_NAME', 'Sicilia'));
+
+// Carica il dataset TerraClimate, che include dati di precipitazione ed evapotranspirazione
+var dataset = ee.ImageCollection('IDAHO_EPSCOR/TERRACLIMATE')
+                .filter(dateFilter) // Filtra per il periodo di interesse
+                .filterBounds(gadm); // Filtra per la regione della Sicilia
+
+// Seleziona le bande di precipitazione ('pr') ed evapotranspirazione ('pet')
+var precipitation = dataset.select('pr'); // Precipitazione mensile
+var evapotranspiration = dataset.select('pet'); // Evapotraspirazione mensile
+
+// Calcola la media mobile per la data target
+var precipMean = precipitation.mean(); // Media delle precipitazioni
+var evapMean = evapotranspiration.mean(); // Media dell'evapotraspirazione
+
+// Ritaglia le immagini alla regione di interesse (Sicilia)
+var precipImg = precipMean.clip(gadm); // Ritaglia la media delle precipitazioni
+var evapImg = evapMean.clip(gadm); // Ritaglia la media dell'evapotraspirazione
+
+// Scala l'immagine di evapotranspirazione per ottenere i valori corretti
+evapImg = evapImg.multiply(0.1); // Scala i valori di evapotraspirazione
+
+// Calcola il bilancio idrico (differenza tra precipitazione ed evapotranspirazione)
+var waterBalance = precipImg.subtract(evapImg).rename('WaterBalance');
+
+// Calcola la media e la deviazione standard del bilancio idrico nella regione
+var meanWB = waterBalance.reduceRegion({
+  reducer: ee.Reducer.mean(), // Calcola la media
+  geometry: gadm,
+  scale: 1000,
+  maxPixels: 1e8
+}).getNumber('WaterBalance');
+
+var stdWB = waterBalance.reduceRegion({
+  reducer: ee.Reducer.stdDev(), // Calcola la deviazione standard
+  geometry: gadm,
+  scale: 1000,
+  maxPixels: 1e8
+}).getNumber('WaterBalance');
+
+// Calcola lo SPEI come bilancio idrico standardizzato
+var spei = waterBalance.subtract(meanWB).divide(stdWB).rename('SPEI');
+
+// Definisce i parametri per la visualizzazione dello SPEI
+var speiVis = {
+  min: -2, // Valore minimo per la visualizzazione
+  max: 2, // Valore massimo per la visualizzazione
+  palette: ['#730000', '#e60000', '#ff2a00', '#ff9f00', '#ffdd00', '#ffff00', 
+            '#aaff55', '#00ff66', '#00ffff', '#0099ff', '#0000ff'] // Scala di colori
+};
+
+// Aggiunge il layer dello SPEI alla mappa
+Map.centerObject(gadm, 7); // Centra la mappa sulla Sicilia
+Map.addLayer(spei, speiVis, 'SPEI (-2 a 2)'); // Aggiunge lo SPEI alla mappa
+
+// Carica il dataset FireCCI per ottenere i dati sugli incendi nei 180 giorni precedenti alla targetDate
+var fireCCI = ee.ImageCollection("ESA/CCI/FireCCI/5_1")
+                .filter(dateFilter)  // Usa lo stesso filtro temporale dello SPEI
+                .filterBounds(gadm); // Filtra per la regione della Sicilia
+
+// Seleziona la banda 'BurnDate' che indica il giorno dell'anno in cui è avvenuto l'incendio
+var burnDate = fireCCI.select('BurnDate').mosaic().clip(gadm);
+
+// Riclassificazione dei livelli di siccità
+var highDrought = spei.lt(-0.8);  
+var lowDrought = spei.gt(-0.8); 
+
+// Incendi nelle aree con alta siccità → NERO
+var highRiskFires = burnDate.updateMask(burnDate.gt(0).and(highDrought));
+
+// Incendi nelle aree con minore siccità → GRIGIO
+var lowRiskFires = burnDate.updateMask(burnDate.gt(0).and(lowDrought));
+
+// Definizione della visualizzazione
+var fireVisHighRisk = { palette: ['black'] };
+var fireVisLowRisk = { palette: ['grey'] };
+
+// Aggiunta degli incendi alla mappa
+Map.addLayer(highRiskFires, fireVisHighRisk, 'Incendi - Alto Rischio');
+Map.addLayer(lowRiskFires, fireVisLowRisk, 'Incendi - Basso Rischio');
+
+// Legenda per lo SPEI
+var legend = ui.Panel({ style: { position: 'bottom-left', padding: '8px 15px' } });
+
+var legendTitle = ui.Label({ value: 'SPEI', style: { fontWeight: 'bold', fontSize: '16px' } });
+legend.add(legendTitle);
+
+var legendLabels = [
+  'Estremamente Umido (2.0 o più)', 'Molto Umido (1.6 a 1.99)', 'Moderatamente Umido (1.3 a 1.59)',
+  'Leggermente Umido (0.8 a 1.29)', 'Fase Umida Iniziale (0.5 a 0.79)', 'Normale (-0.49 a 0.49)',
+  'Fase Secca Iniziale (-0.79 a -0.50)', 'Siccità Lieve (-1.29 a -0.80)', 
+  'Siccità Moderata (-1.59 a -1.30)', 'Siccità Grave (-1.99 a -1.60)', 'Siccità Estrema (-2.0 o meno)'
+];
+
+var legendColors = ['#00aaff', '#00ffff', '#00ff66', '#aaff55', '#ffff00', '#ffffff', 
+                    '#ffdd00', '#ff9f00', '#ff2a00', '#e60000', '#730000'];
+
+var makeLegend = function(labels, colors) {
+  var panel = ui.Panel({ style: { padding: '5px' } });
+
+  for (var i = 0; i < labels.length; i++) {
+    var colorBox = ui.Label({
+      style: {
+        backgroundColor: colors[i], padding: '8px', margin: '2px',
+        width: '20px', height: '20px'
+      }
+    });
+
+    var label = ui.Label({ value: labels[i], style: { fontSize: '12px', margin: '0 0 0 10px' } });
+
+    panel.add(ui.Panel([colorBox, label], ui.Panel.Layout.Flow('horizontal')));
+  }
+  return panel;
+};
+
+// Aggiunta della legenda alla mappa
+legend.add(makeLegend(legendLabels, legendColors));
+Map.add(legend);
+
+// Zone di una determinata siccità e con o senza incendi
+var legend2 = ui.Panel({ style: { position: 'bottom-right', padding: '8px 15px' } });
+
+var legendTitle2 = ui.Label({ value: 'Zone di una determinata siccità e con eventuali incendi', style: { fontWeight: 'bold', fontSize: '16px' } });
+legend2.add(legendTitle2);
+
+var legendLabels2 = ['Zone umide senza incendi', 'Zone umide con incendi', 'Zone siccitose senza incendi', 'Zone siccitose con incendi'];
+var legendColors2 = ['blue', 'yellow', 'orange', 'red'];
+
+legend2.add(makeLegend(legendLabels2, legendColors2));
+Map.add(legend2);
+
+// Crea una maschera per identificare la presenza di incendi (BurnDate > 0)
+var fireMask = burnDate.gt(0);  // Valore 1 se c'è stato un incendio, 0 altrimenti
+
+// Combina le maschere per ottenere le zone di rischio incendio
+var highRiskFire = fireMask.and(highDrought); // Incendi in alta siccità
+var lowRiskFire = fireMask.and(lowDrought); // Incendi in bassa siccità
+
+// Creazione del primo layer (incendi in alta o bassa siccità)
+var riskFireLayer = highRiskFire.add(lowRiskFire.multiply(2)); // Incendi in alta (rosso) o bassa siccità (giallo)
+
+// Creazione del secondo layer (alta e bassa siccità senza incendi)
+var droughtLayer = highDrought.add(lowDrought.multiply(2)); // Alta siccità senza incendi (verde) e bassa siccità senza incendi (blu)
+
+var riskFireVis = {
+  min: 1,
+  max: 2,
+  palette: ['red', 'yellow'] // Colori per incendi in alta e bassa siccità
+};
+
+var droughtVis = {
+  min: 1,
+  max: 2,
+  palette: ['orange', 'blue'] // Colori per siccità senza incendi
+};
+
+Map.addLayer(droughtLayer, droughtVis, 'Siccità senza Incendi (Alta/Bassa Siccità)');
+Map.addLayer(riskFireLayer, riskFireVis, 'Rischio Incendi (Alta/Bassa Siccità)');
+
+// Centra sulla zona di interesse (ad esempio la Sicilia)
+Map.centerObject(gadm, 7);  // Centra sulla Sicilia
+
+
